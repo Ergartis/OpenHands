@@ -39,8 +39,8 @@ the parent repo bumps its submodule pointer as a separate commit. Follow the roo
 | Layer | Where | What it is | Modifiable? |
 |---|---|---|---|
 | **Application server** | `openhands/app_server/` (this repo) | FastAPI app: conversation lifecycle (`app_conversation/`), events (`event/`, `event_callback/`), sandbox launch (`sandbox/` — docker/remote/process services), settings & LLM profiles (`settings/llm_profiles.py`), integrations, MCP | ✅ yes — primary place for orchestration changes |
-| **Agent server** (in-sandbox) | external pkg `openhands-agent-server==1.35.0` | the server that runs inside a sandbox and executes runs | ⚠️ pinned PyPI dep — not in this repo |
-| **Agent loop / SDK** | external pkgs `openhands-sdk==1.35.0`, `openhands-tools==1.35.0` | the actual agent loop, LLM class (litellm-based), tools | ⚠️ pinned PyPI dep — not in this repo |
+| **Agent server** (in-sandbox) | external pkg `openhands-agent-server==1.37.1` | the server that runs inside a sandbox and executes runs | ⚠️ pinned PyPI dep — not in this repo |
+| **Agent loop / SDK** | external pkgs `openhands-sdk==1.37.1`, `openhands-tools==1.37.1` | the actual agent loop, LLM class (litellm-based), tools | ⚠️ pinned PyPI dep — not in this repo |
 
 Consequences:
 
@@ -84,8 +84,10 @@ repo — especially `references/engine-adapters.md` and `references/llm-gateway.
 
 **Current (2026-07):** the Ergatis platform SaaS is nearly done (tasks, budgets,
 kill-switch, Task Console, recording pipeline — live with the Claude Code engine). The
-OpenHands platform adapter does not exist yet; this fork is unmodified upstream. The
-work is *beginning* here.
+OpenHands platform adapter does not exist yet; this fork carries **no code changes** —
+only this skill — and was last synced with `upstream/main` (`OpenHands/OpenHands`) on
+2026-07-27. Keep it that way: sync upstream regularly so the first real change lands on
+a current base. The work is *beginning* here.
 
 **Target MVP — Phase 1 (near-term): the pre-PR acceptance-verifier loop**
 
