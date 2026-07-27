@@ -3,6 +3,8 @@
 import io
 import json
 import os
+import sys
+import types
 import zipfile
 from datetime import datetime
 from types import SimpleNamespace
@@ -30,8 +32,11 @@ from openhands.app_server.app_conversation.app_conversation_service import (
 )
 from openhands.app_server.app_conversation.live_status_app_conversation_service import (
     LiveStatusAppConversationService,
+    _exception_detail,
+    _resolve_title_llm_profile,
     effective_disabled_skills,
 )
+from openhands.app_server.errors import SandboxError
 from openhands.app_server.integrations.provider import ProviderToken, ProviderType
 from openhands.app_server.integrations.service_types import SuggestedTask, TaskType
 from openhands.app_server.sandbox.sandbox_models import (
@@ -209,6 +214,37 @@ def allow_short_context_windows():
             os.environ[_ALLOW_SHORT_CONTEXT_WINDOWS] = old
         else:
             os.environ.pop(_ALLOW_SHORT_CONTEXT_WINDOWS, None)
+
+
+def test_title_profile_resolution_prefers_available_explicit_profile():
+    profiles = LLMProfiles()
+    profiles.save('Default', LLM(model='openai/gpt-4o'))
+    profiles.save('Titles', LLM(model='anthropic/claude-haiku-3-5'))
+    profiles.active = 'Default'
+    user = _TestUserInfo(title_llm_profile='Titles')
+    user.llm_profiles = profiles
+
+    assert _resolve_title_llm_profile(user) == 'Titles'
+
+
+def test_title_profile_resolution_falls_back_to_available_active_profile():
+    profiles = LLMProfiles()
+    profiles.save('Default', LLM(model='openai/gpt-4o'))
+    profiles.active = 'Default'
+    user = _TestUserInfo(title_llm_profile='Deleted')
+    user.llm_profiles = profiles
+
+    assert _resolve_title_llm_profile(user) == 'Default'
+
+
+def test_title_profile_resolution_omits_unseedable_profiles():
+    profiles = LLMProfiles()
+    profiles.save('../unsafe', LLM(model='openai/gpt-4o'))
+    profiles.active = '../unsafe'
+    user = _TestUserInfo(title_llm_profile='../unsafe')
+    user.llm_profiles = profiles
+
+    assert _resolve_title_llm_profile(user) is None
 
 
 class TestLiveStatusAppConversationService:
@@ -677,6 +713,167 @@ class TestLiveStatusAppConversationService:
         assert isinstance(result['MY_SECRET'], StaticSecret)
         assert result['MY_SECRET'].description == ''
 
+    @staticmethod
+    def _install_managed_key_refresh_modules(
+        monkeypatch, *, get_key, rotate_key, verify_key
+    ):
+        storage_mod = types.ModuleType('storage')
+        lite_llm_mod = types.ModuleType('storage.lite_llm_manager')
+        lite_llm_mod.LiteLlmManager = SimpleNamespace(verify_key=verify_key)
+
+        store = SimpleNamespace(
+            get_current_managed_llm_key=get_key,
+            rotate_managed_llm_key=rotate_key,
+        )
+        saas_settings_mod = types.ModuleType('storage.saas_settings_store')
+        saas_settings_mod.ManagedLlmKeyStatus = SimpleNamespace(ROTATED='rotated')
+        saas_settings_mod.SaasSettingsStore = SimpleNamespace(
+            get_instance=AsyncMock(return_value=store)
+        )
+
+        monkeypatch.setitem(sys.modules, 'storage', storage_mod)
+        monkeypatch.setitem(sys.modules, 'storage.lite_llm_manager', lite_llm_mod)
+        monkeypatch.setitem(
+            sys.modules, 'storage.saas_settings_store', saas_settings_mod
+        )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        'llm_base_url',
+        [
+            'https://llm-proxy.app.all-hands.dev',
+            'https://llm-proxy.staging.all-hands.dev',
+            None,
+        ],
+    )
+    async def test_maybe_refresh_managed_llm_key_refreshes_stale_key(
+        self, monkeypatch, llm_base_url
+    ):
+        org_id = uuid4()
+        self.service.app_mode = 'saas'
+        self.mock_user.id = 'user-123'
+        self.mock_user_context.get_effective_org_id = AsyncMock(return_value=org_id)
+
+        get_key = AsyncMock(return_value='sk-old-managed-key')
+        rotate_key = AsyncMock(
+            return_value=SimpleNamespace(status='rotated', new_key='sk-new-managed-key')
+        )
+        verify_key = AsyncMock(return_value=False)
+        self._install_managed_key_refresh_modules(
+            monkeypatch, get_key=get_key, rotate_key=rotate_key, verify_key=verify_key
+        )
+
+        llm = LLM(
+            model='openhands/gpt-5.5',
+            base_url=llm_base_url,
+            api_key=SecretStr('sk-old-managed-key'),
+        )
+
+        refreshed = await self.service._maybe_refresh_managed_llm_key(
+            self.mock_user, llm
+        )
+
+        assert refreshed.api_key.get_secret_value() == 'sk-new-managed-key'
+        get_key.assert_awaited_once_with()
+        verify_key.assert_awaited_once_with('sk-old-managed-key', 'user-123')
+        rotate_key.assert_awaited_once_with()
+
+    @pytest.mark.asyncio
+    async def test_maybe_refresh_managed_llm_key_skips_non_saas(self, monkeypatch):
+        self.service.app_mode = 'test'
+        get_key = AsyncMock()
+        rotate_key = AsyncMock()
+        verify_key = AsyncMock()
+        self._install_managed_key_refresh_modules(
+            monkeypatch, get_key=get_key, rotate_key=rotate_key, verify_key=verify_key
+        )
+        llm = LLM(
+            model='openhands/gpt-5.5',
+            base_url='https://llm-proxy.app.all-hands.dev',
+            api_key=SecretStr('sk-old-managed-key'),
+        )
+
+        result = await self.service._maybe_refresh_managed_llm_key(self.mock_user, llm)
+
+        assert result is llm
+        get_key.assert_not_called()
+        verify_key.assert_not_called()
+        rotate_key.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_maybe_refresh_managed_llm_key_skips_non_managed_base_url(
+        self, monkeypatch
+    ):
+        self.service.app_mode = 'saas'
+        self.mock_user.id = 'user-123'
+        get_key = AsyncMock()
+        rotate_key = AsyncMock()
+        verify_key = AsyncMock()
+        self._install_managed_key_refresh_modules(
+            monkeypatch, get_key=get_key, rotate_key=rotate_key, verify_key=verify_key
+        )
+        llm = LLM(
+            model='openai/gpt-4',
+            base_url='https://api.openai.com/v1',
+            api_key=SecretStr('sk-byok-key'),
+        )
+
+        result = await self.service._maybe_refresh_managed_llm_key(self.mock_user, llm)
+
+        assert result is llm
+        get_key.assert_not_called()
+        verify_key.assert_not_called()
+        rotate_key.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_maybe_refresh_managed_llm_key_skips_openhands_custom_base_url(
+        self, monkeypatch
+    ):
+        self.service.app_mode = 'saas'
+        self.mock_user.id = 'user-123'
+        get_key = AsyncMock()
+        rotate_key = AsyncMock()
+        verify_key = AsyncMock()
+        self._install_managed_key_refresh_modules(
+            monkeypatch, get_key=get_key, rotate_key=rotate_key, verify_key=verify_key
+        )
+        llm = LLM(
+            model='openhands/gpt-5.5',
+            base_url='https://custom-llm-proxy.example.com',
+            api_key=SecretStr('sk-byok-key'),
+        )
+
+        result = await self.service._maybe_refresh_managed_llm_key(self.mock_user, llm)
+
+        assert result is llm
+        get_key.assert_not_called()
+        verify_key.assert_not_called()
+        rotate_key.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_maybe_refresh_managed_llm_key_skips_key_mismatch(self, monkeypatch):
+        org_id = uuid4()
+        self.service.app_mode = 'saas'
+        self.mock_user.id = 'user-123'
+        self.mock_user_context.get_effective_org_id = AsyncMock(return_value=org_id)
+        get_key = AsyncMock(return_value='sk-different-managed-key')
+        rotate_key = AsyncMock()
+        verify_key = AsyncMock()
+        self._install_managed_key_refresh_modules(
+            monkeypatch, get_key=get_key, rotate_key=rotate_key, verify_key=verify_key
+        )
+        llm = LLM(
+            model='openhands/gpt-5.5',
+            base_url='https://llm-proxy.app.all-hands.dev',
+            api_key=SecretStr('sk-profile-or-byok-key'),
+        )
+
+        result = await self.service._maybe_refresh_managed_llm_key(self.mock_user, llm)
+
+        assert result is llm
+        verify_key.assert_not_called()
+        rotate_key.assert_not_called()
+
     @pytest.mark.asyncio
     async def test_configure_llm_and_mcp_with_custom_model(self):
         """Test _configure_llm_and_mcp with custom LLM model."""
@@ -1011,6 +1208,39 @@ class TestLiveStatusAppConversationService:
         assert isinstance(result, StartConversationRequest)
         assert result.conversation_id == conversation_id
         self.service._load_skills_and_update_agent.assert_called_once()
+
+    @patch(
+        'openhands.app_server.app_conversation.live_status_app_conversation_service.get_default_tools',
+        return_value=[],
+    )
+    @pytest.mark.asyncio
+    async def test_build_request_passes_title_llm_profile(self, _mock_tools):
+        profiles = LLMProfiles()
+        profiles.save('Titles', LLM(model='anthropic/claude-haiku-3-5'))
+        self.mock_user.llm_profiles = profiles
+        self.mock_user.title_llm_profile = 'Titles'
+        self.mock_user_context.get_user_info.return_value = self.mock_user
+
+        real_llm = LLM(model='gpt-4', api_key=SecretStr('test-key'))
+        mock_agent = Mock(spec=Agent)
+        mock_agent.llm = real_llm
+        mock_agent.condenser = None
+        self.service._setup_secrets_for_git_providers = AsyncMock(return_value={})
+        self.service._configure_llm_and_mcp = AsyncMock(return_value=(real_llm, {}))
+        self.service._load_skills_and_update_agent = AsyncMock(return_value=mock_agent)
+
+        request = await self.service._build_start_conversation_request_for_user(
+            sandbox=self.mock_sandbox,
+            conversation_id=uuid4(),
+            initial_message=None,
+            system_message_suffix=None,
+            git_provider=None,
+            working_dir='/test/dir',
+            remote_workspace=Mock(spec=AsyncRemoteWorkspace),
+            selected_repository='test_repo',
+        )
+
+        assert request.title_llm_profile == 'Titles'
 
     @patch(
         'openhands.app_server.app_conversation.live_status_app_conversation_service.get_default_tools',
@@ -4109,6 +4339,18 @@ class TestBuildAcpStartConversationRequestSecrets:
         assert request.agent.acp_isolate_data_dir is True
 
     @pytest.mark.asyncio
+    async def test_acp_request_passes_title_llm_profile(self, service, tmp_path):
+        user = self._make_acp_user()
+        profiles = LLMProfiles()
+        profiles.save('Titles', LLM(model='anthropic/claude-haiku-3-5'))
+        user.llm_profiles = profiles
+        user.title_llm_profile = 'Titles'
+
+        request = await self._call_build(service, user, tmp_path)
+
+        assert request.title_llm_profile == 'Titles'
+
+    @pytest.mark.asyncio
     async def test_lookup_secret_forwarded_as_source(self, service, tmp_path):
         """LookupSecrets from user_context are forwarded as-is."""
         lookup = LookupSecret(url='https://example.com/token', headers={})
@@ -4338,3 +4580,12 @@ class TestBuildAcpStartConversationRequestSecrets:
             'conversation_id': str(request.conversation_id),
             'agent_kind': 'acp',
         }
+
+
+def test_exception_detail_strips_http_status_prefix():
+    """SandboxError.__str__ carries a '500: ' prefix; task.detail should not."""
+    assert (
+        _exception_detail(SandboxError('The system is at capacity right now.'))
+        == 'The system is at capacity right now.'
+    )
+    assert _exception_detail(ValueError('boom')) == 'boom'

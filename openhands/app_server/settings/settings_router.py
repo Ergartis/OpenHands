@@ -321,7 +321,7 @@ async def store_settings(
                     settings_changed=settings_changed,
                 )
         except Exception:
-            logger.exception('analytics:settings_saved:failed')
+            logger.exception('analytics:settings_saved:failed', stack_info=True)
 
         return JSONResponse(
             status_code=status.HTTP_200_OK,
@@ -686,6 +686,8 @@ async def rename_profile(
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT, detail=str(exc)
             ) from exc
+        if settings.title_llm_profile == name:
+            settings.title_llm_profile = request.new_name
         await settings_store.store(settings)
 
     return ProfileMutationResponse(

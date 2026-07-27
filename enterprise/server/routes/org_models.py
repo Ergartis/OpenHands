@@ -32,6 +32,8 @@ from openhands.sdk.settings import (
 
 logger = logging.getLogger(__name__)
 
+MEMBER_PRIVATE_AGENT_KEYS: frozenset[str] = frozenset({'mcp_config'})
+
 
 class OrgCreationError(Exception):
     """Base exception for organization creation errors."""
@@ -298,6 +300,9 @@ class OrgUpdate(BaseModel):
 
     def _normalize_agent_settings_diff(self) -> None:
         """Normalize nested LLM settings inside ``agent_settings_diff``."""
+        if self.agent_settings_diff is not None:
+            for key in MEMBER_PRIVATE_AGENT_KEYS:
+                self.agent_settings_diff.pop(key, None)
         llm_diff = self._get_agent_llm_diff()
         if llm_diff is None:
             return
@@ -908,7 +913,7 @@ class DailyUsageData(BaseModel):
 
     date: str  # ISO date string (YYYY-MM-DD)
     tokens: int = 0
-    conversations: int = 0
+    conversations: int = 0  # Conversations started
 
 
 class TeamUsageData(BaseModel):
@@ -970,7 +975,8 @@ class OrgUsageStats(BaseModel):
 
     # Top-level metrics
     active_users: int = 0  # Users with activity in last 7 days
-    agent_runs: int = 0  # Total conversations in last 7 days
+    agent_runs: int = 0  # Conversations started in last 7 days
+    usage_conversation_count: int = 0  # Conversations with usage in last 7 days
     total_tokens: int = 0  # Total tokens in last 7 days
     estimated_spend: float = 0.0  # Estimated cost in last 7 days
 

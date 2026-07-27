@@ -18,7 +18,7 @@ from fastapi import APIRouter, Body, Depends, HTTPException, Path, status
 from pydantic import BaseModel, Field, ValidationError
 from server.constants import LITE_LLM_API_URL
 from server.routes.org_models import OrgNotFoundError
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from storage.agent_profile_resolution import (
     OrgLLMProfileMutator,
@@ -145,7 +145,7 @@ async def _get_org(org_id: UUID, user_id: str) -> Org:
     try:
         return await OrgService.get_org_by_id(org_id=org_id, user_id=user_id)
     except OrgNotFoundError as e:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e)) from e
 
 
 @contextlib.asynccontextmanager
@@ -258,7 +258,9 @@ async def save_profile(
         try:
             profiles.save(name, llm, include_secrets=request.include_secrets)
         except ProfileLimitExceededError as exc:
-            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc))
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT, detail=str(exc)
+            ) from exc
 
     return ProfileMutationResponse(name=name, message=f"Profile '{name}' saved")
 
@@ -277,7 +279,7 @@ async def delete_profile(
     makes the referrer check and the delete atomic.
     """
     async with _org_profiles_transaction(org_id, user_id) as (
-        _session,
+        session,
         org,
         profiles,
     ):
@@ -290,7 +292,17 @@ async def delete_profile(
         try:
             delete_llm_profile(agent_profiles, OrgLLMProfileMutator(profiles), name)
         except ProfileReferenced as exc:
-            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc))
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT, detail=str(exc)
+            ) from exc
+        await session.execute(
+            update(OrgMember)
+            .where(
+                OrgMember.org_id == org_id,
+                OrgMember.title_llm_profile == name,
+            )
+            .values(title_llm_profile=None)
+        )
 
     return ProfileMutationResponse(name=name, message=f"Profile '{name}' deleted")
 
@@ -401,7 +413,7 @@ async def rename_profile(
     written back in the same transaction.
     """
     async with _org_profiles_transaction(org_id, user_id) as (
-        _session,
+        session,
         org,
         profiles,
     ):
@@ -421,18 +433,30 @@ async def rename_profile(
                 request.new_name,
             )
         except ProfileNotFoundError as exc:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc))
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)
+            ) from exc
         except ProfileAlreadyExistsError as exc:
-            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc))
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT, detail=str(exc)
+            ) from exc
         except ValueError as exc:
             # rename_llm_profile validates new_name against PROFILE_NAME_PATTERN.
             raise HTTPException(
                 status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc)
-            )
+            ) from exc
         # The cascade may have repointed agent-profile refs — persist them too.
         after = agent_profiles.model_dump(mode='json', context={'expose_secrets': True})
         if after != before:
             org.agent_profiles = after
+        await session.execute(
+            update(OrgMember)
+            .where(
+                OrgMember.org_id == org_id,
+                OrgMember.title_llm_profile == name,
+            )
+            .values(title_llm_profile=request.new_name)
+        )
 
     return ProfileMutationResponse(
         name=request.new_name,

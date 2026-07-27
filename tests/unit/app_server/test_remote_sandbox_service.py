@@ -212,6 +212,42 @@ class TestRemoteSandboxService:
             await remote_sandbox_service._send_runtime_api_request('GET', '/test')
 
     @pytest.mark.asyncio
+    async def test_send_runtime_api_request_get_retries_once_on_timeout(
+        self, remote_sandbox_service
+    ):
+        """A timed-out idempotent read is retried once and can succeed."""
+        # Setup
+        mock_response = MagicMock()
+        remote_sandbox_service.httpx_client.request.side_effect = [
+            httpx.TimeoutException('Request timeout'),
+            mock_response,
+        ]
+
+        # Execute
+        response = await remote_sandbox_service._send_runtime_api_request(
+            'GET', '/test'
+        )
+
+        # Verify
+        assert response == mock_response
+        assert remote_sandbox_service.httpx_client.request.call_count == 2
+
+    @pytest.mark.asyncio
+    async def test_send_runtime_api_request_post_does_not_retry(
+        self, remote_sandbox_service
+    ):
+        """Non-idempotent requests are not retried on timeout."""
+        # Setup
+        remote_sandbox_service.httpx_client.request.side_effect = (
+            httpx.TimeoutException('Request timeout')
+        )
+
+        # Execute & Verify
+        with pytest.raises(httpx.TimeoutException):
+            await remote_sandbox_service._send_runtime_api_request('POST', '/start')
+        assert remote_sandbox_service.httpx_client.request.call_count == 1
+
+    @pytest.mark.asyncio
     async def test_send_runtime_api_request_http_error(self, remote_sandbox_service):
         """Test API request HTTP error handling."""
         # Setup
@@ -407,6 +443,34 @@ class TestSandboxInfoConversion:
         assert sandbox_info.status == SandboxStatus.STARTING
         assert sandbox_info.session_api_key == 'test-session-key'
         assert sandbox_info.exposed_urls is None
+
+    @pytest.mark.asyncio
+    async def test_to_sandbox_info_carries_status_detail(self, remote_sandbox_service):
+        """status_detail from the runtime payload flows onto SandboxInfo."""
+        runtime_data = create_runtime_data(status='starting')
+        runtime_data['status_detail'] = (
+            '0/1 nodes are available: 1 Insufficient smarter-devices/kvm.'
+        )
+        sandbox_info = remote_sandbox_service._to_sandbox_info(
+            create_stored_sandbox(), runtime_data
+        )
+        assert sandbox_info.status_detail == (
+            '0/1 nodes are available: 1 Insufficient smarter-devices/kvm.'
+        )
+
+    @pytest.mark.asyncio
+    async def test_to_sandbox_info_status_detail_defaults_none(
+        self, remote_sandbox_service
+    ):
+        """Absent status_detail (and no runtime) -> None, no crash."""
+        stored = create_stored_sandbox()
+        assert (
+            remote_sandbox_service._to_sandbox_info(stored, None).status_detail is None
+        )
+        running = remote_sandbox_service._to_sandbox_info(
+            stored, create_runtime_data(status='running')
+        )
+        assert running.status_detail is None
 
     @pytest.mark.asyncio
     async def test_to_sandbox_info_loads_runtime_when_none_provided(
