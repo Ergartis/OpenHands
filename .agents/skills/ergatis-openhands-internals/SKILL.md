@@ -1,154 +1,159 @@
 ---
 name: ergatis-openhands-internals
 description: >
-  Working guide for modifying this OpenHands fork (github.com/YugmaF/OpenHands) as the
-  second coding engine of the Ergatis platform. You MUST consult this skill whenever you
-  change anything in this repository — agent loop behavior, conversation orchestration,
-  hooks, sandbox services, events, LLM settings, or the frontend — and whenever the task
-  mentions the Ergatis verifier loop, acceptance tests, per-stage models, the quality
-  loop, or wiring OpenHands to the Ergatis platform. It defines which layer a change
-  belongs to, the Ergatis product contract you must not break, and what is current
-  state vs. future MVP target.
+  Working guide for the OpenHands fork (github.com/YugmaF/OpenHands) as it relates to the
+  Ergatis platform. You MUST consult this skill whenever you change anything in this
+  repository, or when a task mentions the OpenHands agent loop, the Ergatis verifier loop,
+  acceptance tests, hooks, the quality loop, or wiring OpenHands to Ergatis. It states what
+  this fork is (and is not) on the run path, where loop orchestration actually lands, and
+  the product contract you must not break. Corrected 2026-08-17: the previous version said
+  orchestration lands in this repo's app_server — it does not.
 triggers:
   - ergatis
   - verifier
   - acceptance tests
   - agent loop
   - app_server
-  - conversation
-  - sandbox
+  - agent-server
+  - hooks
   - quality loop
 ---
 
 # Ergatis × OpenHands Internals
 
-## Why this fork exists
+## What this fork is — and what runs in production
 
-This is Ergatis's fork of OpenHands. Ergatis (the parent repo, two levels up at the
-git-submodule mount `runners/openhands/`) is a multi-tenant SaaS that runs coding agents
-against customer repos, metered by credits. OpenHands is being wired in as the **second
-engine** behind Ergatis's frozen `CodingEnginePort`. Platform-side code (the adapter,
-tenancy, budgets, APIs) lives in the parent repo's `platform/` — **never here**. What
-lives HERE is agent-loop **orchestration**: the changes to how OpenHands runs a task.
-Fork workflow: feature branch in this repo → verify → merge to this fork's `main`;
-the parent repo bumps its submodule pointer as a separate commit. Follow the root
-`AGENTS.md` (install pre-commit hooks first; pre-commit + lint must pass).
+Ergatis (parent repo, two levels up; this is the submodule `runners/openhands/`) is a
+multi-tenant SaaS that runs coding agents against customer repos, metered by credits.
+OpenHands is its second engine behind the frozen `CodingEnginePort`.
 
-## The three layers — decide where your change belongs BEFORE coding
+**Production does not run this repository.** The platform adapter
+(`platform/src/main/java/com/ergatis/platform/engine/adapter/openhands/`) runs the upstream
+**`openhands-agent-server`** binary from Ergatis's own sandbox image
+(`runners/openhands-sandbox/Dockerfile`, `FROM ghcr.io/openhands/agent-server:1.37.1-python`)
+and drives it over REST. It **deliberately bypasses this repo's `app_server`** (a second
+control plane — DB, users, settings, sandbox lifecycle — that would sit inside ours and break
+`stop()` and the budget kill-switch). See `docs/25-openhands-architecture.md` in the parent.
 
-| Layer | Where | What it is | Modifiable? |
+| Layer | Where | On the Ergatis run path? | Modifiable? |
 |---|---|---|---|
-| **Application server** | `openhands/app_server/` (this repo) | FastAPI app: conversation lifecycle (`app_conversation/`), events (`event/`, `event_callback/`), sandbox launch (`sandbox/` — docker/remote/process services), settings & LLM profiles (`settings/llm_profiles.py`), integrations, MCP | ✅ yes — primary place for orchestration changes |
-| **Agent server** (in-sandbox) | external pkg `openhands-agent-server==1.37.1` | the server that runs inside a sandbox and executes runs | ⚠️ pinned PyPI dep — not in this repo |
-| **Agent loop / SDK** | external pkgs `openhands-sdk==1.37.1`, `openhands-tools==1.37.1` | the actual agent loop, LLM class (litellm-based), tools | ⚠️ pinned PyPI dep — not in this repo |
+| Application server (`openhands/app_server/`, frontend) | this repo | **No** | yes, but pointless for Ergatis |
+| Agent server (in-sandbox REST) | PyPI `openhands-agent-server==1.37.1`, inside our image | **Yes** | pinned dep — not here |
+| Agent loop / tools / SDK | PyPI `openhands-sdk==1.37.1`, `openhands-tools==1.37.1` | **Yes** | pinned dep — not here |
+| **Conversation start body** (`AgentServerClient.body()`) | parent `platform/…/engine/adapter/openhands/` | **Yes** | ✅ primary orchestration seam |
+| **Sandbox image** (hooks, verifier, guards, MCP servers, recorder) | parent `runners/openhands-sandbox/` | **Yes** | ✅ primary orchestration seam |
 
 Consequences:
 
-- **The agent loop itself is NOT in this repository.** `pyproject.toml` exact-pins the
-  three `openhands-*` packages (no path/git overrides). If a change truly requires
-  editing loop internals, that is a *new decision* — forking agent-sdk or vendoring —
-  which must be surfaced to the user, not made silently. Prefer expressing loop changes
-  as **orchestration in `app_server`**: `app_conversation/app_conversation_start_task_service.py`
-  (task start flows), `app_conversation/hook_loader.py` and `skill_loader.py` (extension
-  seams), `event_callback/` (react to run events).
-- Version bumps of the pinned SDK packages are explicit and deliberate (see the
-  pyproject comments) — never float them.
+- **This fork carries no code changes and should stay that way** unless an SDK change is
+  genuinely unavoidable. That is a **new decision to surface to the user** (fork
+  `agent-sdk` / vendor a package / upstream PR), never a silent step. Keep the fork synced
+  with `upstream/main` so a first real change lands on a current base; last sync
+  2026-07-27.
+- To **read the loop source**, do not hunt in this repo — clone the SDK at the pinned tag:
+  `git clone --depth 1 --branch v1.37.1 https://github.com/OpenHands/agent-sdk`
+  (`openhands-sdk`, `openhands-tools`, `openhands-agent-server` in one repo). The image
+  ships the SDK as a compiled binary; there is no `.py` to read inside it.
+- **Where loop changes land**: the start body + the sandbox image, in the parent repo,
+  under the parent skill `.agents/skills/ergatis-platform-integration/` (read
+  `references/engine-adapters.md`, sections *The Ergatis loop around agent-server* and
+  *Start-body contract: prove every field landed*). The analysis behind this —
+  weaknesses of the 1.37.1 loop for industrial repos and the recommended sequence — is
+  `docs/26-openhands-agent-loop-findings.md`.
+- Version bumps of the pinned `openhands-*` packages are explicit and deliberate — never
+  float them, and re-run the parent's live-server contract test on every bump.
+
+## The loop primitives already in SDK 1.37.1 (use these, do not reinvent)
+
+All accepted by `POST /api/conversations` on agent-server:
+
+- `hook_config` — Claude-Code-compatible **command hooks** (JSON on stdin; `exit 2` or
+  `{"decision":"deny","reason":…}` blocks; `exit 1` does **not** block). Events:
+  `PreToolUse, PostToolUse, UserPromptSubmit, SessionStart, SessionEnd, Stop`. The **Stop
+  hook** fires on every finish (finish tool *and* prose reply) and a denial re-arms the loop
+  with the reason injected — this is the bounded verify→fix primitive. Hooks are plain
+  subprocesses in the sandbox; they call no model.
+- `confirmation_policy` (`AlwaysConfirm | NeverConfirm | ConfirmRisky`) + `security_analyzer`,
+  answered externally via `POST …/events/respond_to_confirmation` — per batch, accept/reject-all.
+- `agent.agent_context.load_project_skills=true` — loads the repo's `AGENTS.md`/`CLAUDE.md`/
+  `.openhands/skills` (default **false**).
+- `agent.condenser` (`LLMSummarizingCondenser` with `max_size` and, importantly, `max_tokens`
+  and its own `llm`), `agent_launch_additions.system_message_suffix_append`, `agent.mcp_config`
+  (stdio MCP servers), `stuck_detection`, `agent.critic` (experimental; do not build the gate
+  on it — its in-loop `git_patch` is always `None` and it misses prose finishes).
+
+**Fail closed.** Nested server models drop unknown fields silently and still answer `201`.
+Every gating field must be **echo-asserted** via `GET /api/conversations/{id}` right after
+start, and the hooks proven armed at runtime (SessionStart marker file) before any verdict
+is trusted. A dropped `hook_config` is a run that *looks* verified.
 
 ## The Ergatis product contract — never break these
 
-The user experience is fixed and lives in the Ergatis platform, not here:
-
-1. **The Task Console is the only user entry point.** Users submit the prompt, watch the
-   live timeline, approve/deny gated actions, and steer — all through Ergatis's
-   `/api/v1/tasks/{id}` API family (events poll, `messages`, `decisions`). Any
-   interaction your change introduces must surface through that channel (via the
-   platform's `CodingEnginePort` adapter), never through a separate UI a tenant user
-   would need.
-2. **The final deliverable is the run recording.** A task ends with a screen recording
-   uploaded to the platform (`POST /api/v1/ingest/tasks/{id}/recording` with a per-task
-   capability token) that the user watches to verify everything was done as asked. Loop
-   changes must keep the run observable and the recording pipeline intact — a verifier
-   iteration that happens invisibly off-screen defeats the product.
-3. **All model traffic goes through the injected endpoint.** The run receives an
-   OpenAI-compatible `base_url` + per-task `api_key` (Ergatis's LiteLLM gateway; virtual
-   key with budget). Never call a provider or openrouter.ai directly, never embed
-   provider keys, never log the key. Stage models are selected by **model name** only
-   (gateway aliases).
-4. **Budgets end runs.** The platform's kill-switch can revoke the key and stop the
-   sandbox mid-run; loop code must tolerate hard stops without corrupting state.
-
-Platform-side details: `.agents/skills/ergatis-platform-integration/` in the parent
-repo — especially `references/engine-adapters.md` and `references/llm-gateway.md`.
+1. **The Task Console is the only user entry point** — prompt, live timeline, approvals,
+   steering all go through Ergatis's `/api/v1/tasks/{id}` API family via the adapter. Never
+   a separate UI a tenant user would need (this repo's frontend is not the tenant surface).
+2. **The final deliverable is the run recording** (uploaded with a per-task capability
+   token). Loop changes must keep the run observable — a verifier iteration that happens
+   invisibly defeats the product; verify attempts are posted to the checks ingest so the
+   timeline and recording show them.
+3. **All model traffic goes through the injected endpoint** — OpenAI-compatible `base_url`
+   + per-task `api_key` (Ergatis's LiteLLM gateway, budget-capped virtual key). Never a
+   provider or openrouter.ai directly, never embed keys, never log the key. Stage models are
+   chosen by **alias name** only; the key already covers the profile's whole alias set.
+4. **Budgets end runs.** The kill-switch revokes the key and stops the sandbox mid-run
+   (`docker stop -t 180`); everything you add (hooks, verifier) must tolerate SIGTERM
+   without corrupting state — write verdicts `tmp`+rename, flush in the wrapper's `cleanup()`.
 
 ## Current state vs. TARGET (do not confuse them)
 
-**Current (2026-07):** the Ergatis platform SaaS is nearly done (tasks, budgets,
-kill-switch, Task Console, recording pipeline — live with the Claude Code engine). The
-OpenHands platform adapter does not exist yet; this fork carries **no code changes** —
-only this skill — and was last synced with `upstream/main` (`OpenHands/OpenHands`) on
-2026-07-27. Keep it that way: sync upstream regularly so the first real change lands on
-a current base. The work is *beginning* here.
+**Current (2026-08):** platform SaaS live with both engines; OpenHands adapter shipped
+(start, events by webhook, steer, resume-after-cap, publish/PR, recording). The start body
+sends **only** workspace, agent{tools, llm, condenser(max_size)}, initial_message, max_iterations
+— no hooks, no confirmation policy, no project skills, no critic. `FINISHED → SUCCEEDED`
+unconditionally; the evidence ledger is display-only; `planMode` is ignored on this engine.
 
-**Target MVP — Phase 1 (near-term): the pre-PR acceptance-verifier loop**
+**Target — Phase 1 (near-term): the pre-PR acceptance-verifier loop**
 
-1. At task start, generate acceptance tests from the task's acceptance criteria —
-   before the agent codes, never from its diff — and **freeze them** as an independent
-   oracle.
-2. **Anti-gaming:** the coding agent must not be able to edit or delete the acceptance
-   suite (outside the writable tree, or diff-guarded).
-3. **Deterministic verdicts:** pass/fail = the real per-language test-runner exit code
-   (`mvn test` / `pytest` / `go test` / `npm test`). The LLM only generates tests and
-   judges genuinely unmechanizable criteria.
-4. **Bounded fix loop:** fail + iterations left → resume the agent with minimal failure
-   feedback (failing test, expected vs actual, repro — not raw logs); pass → open the
-   PR; exhausted → hand to a human via the platform (`NEEDS_ATTENTION`), never silent
-   success. Platform vocabulary already exists for this: `TaskStatus.VERIFYING`,
+1. Generate acceptance tests from the task's criteria **before** the agent codes (separate
+   stage, `VERIFICATION`/`PLANNING` alias, different model than the coder) and **freeze**
+   them (sha recorded) as an independent oracle. Never let the coding agent propose them.
+2. **Anti-gaming**: suite lives outside `/workspace/project` (root-owned, 0555 — agent-server
+   runs as uid 10001), copied in at verify time; `PreToolUse` deny on protected paths;
+   diff-guard against `.git/ergatis_base_sha`.
+3. **Deterministic verdicts**: the Stop hook runs the real runner (`mvn test` / `pytest` /
+   `go test` / `npm test`); exit code decides. LLM judges only genuinely unmechanisable
+   criteria.
+4. **Bounded fix loop**: fail + attempts left → deny with minimal feedback (failing test,
+   expected vs actual, repro — never raw logs); pass → allow → PR; exhausted → allow but
+   `verdict=exhausted` → platform `NEEDS_ATTENTION`, never silent success. Platform
+   vocabulary exists: `TaskStatus.VERIFYING` (unused today), phase `verifying` (reserved),
    `EngineRunSpec.maxIterations`.
 
-**Target MVP — Phase 2 (deferred, do NOT build yet):** post-PR quality loop — PR-review
-agent runs on PR; the **org's existing Sonar gate** (coverage/security/quality) is
-consumed via its webhook/API — never bundle a Sonar server into the loop or sandbox —
-and its verdict decides re-enter-the-loop (failed, with findings) vs stage done
-(passed); Java unit-test tool for coverage; human merge → CD to perf/UAT. The review
-tool, the Java test tool, and the org Sonar server are **org infrastructure outside
-both repos** — confirm location with the user before wiring. The acceptance oracle
-(Phase 1, per-task, never ships) and coverage tests (Phase 2, ship with code) are
-different artifacts — never conflate them.
+**Target — Phase 2 (deferred, do NOT build yet):** post-PR quality loop — PR-review agent,
+the **org's existing Sonar gate** consumed via webhook/API (never bundled), Java unit-test
+tool for coverage. Acceptance oracle (per-task, never ships) ≠ coverage tests (ship) —
+never conflate.
 
-**Per-stage models (target):** stages pick price/quality via gateway model aliases.
-Selection is **deterministic, config-driven** — a fixed stage→alias mapping, never a
-runtime/LLM choice, never boxed to one vendor model. Optimization target: **fewer
-issues per task** (minimize rework first, cost second); put model quality where the
-oracle is created (planning, test generation). ⚠️ Prerequisite in the platform, not
-here: today Ergatis mints the virtual key scoped to ONE model — the mint must be
-widened to the stage-alias set first.
-
-## Dev workflow (from the root `AGENTS.md` — follow it fully)
+## Dev workflow for this repo (only if you really must change it)
 
 ```bash
-make install-pre-commit-hooks       # ALWAYS first, before any change
-make build                          # full setup (backend + frontend), when needed
-
-# after backend changes:
-pre-commit run --config ./dev_config/python/.pre-commit-config.yaml
-
-# after frontend changes:
-cd frontend && npm run lint:fix && npm run build
+make install-pre-commit-hooks       # ALWAYS first
+pre-commit run --config ./dev_config/python/.pre-commit-config.yaml   # after backend changes
 ```
 
-Pre-commit and lint MUST pass before pushing. Prefer `git add <file>` over `git add .`;
-pin third-party GitHub Actions to full SHAs. Local full-app run recipe and its
-troubleshooting notes are in the root `AGENTS.md`.
+Feature branch in this repo → verify → merge to the fork's `main`; the parent bumps the
+submodule pointer as its own commit. Prefer `git add <file>` over `git add .`.
 
 ## Common failure modes
 
 | Mistake | Correct behavior |
 |---|---|
-| Hunting for the agent loop in this repo | It's in the pinned `openhands-sdk` package — orchestrate from `app_server`, or escalate the SDK-fork decision to the user |
-| Building UI here for tenant-facing interaction | Tenant interaction goes through the Ergatis Task Console; this fork's frontend is not the tenant surface |
-| Calling providers/OpenRouter directly from loop code | Only the injected `base_url` + per-task key; models by alias name |
-| Implementing Phase 2 (review agent / Sonar) now | Phase 1 verifier loop first; Phase 2 is explicitly deferred |
-| Letting the agent touch the acceptance suite | The oracle is frozen and out of the agent's reach — that is the point |
-| Treating a failed gate/verdict as terminal | Failures re-enter the bounded loop as feedback; only exhaustion goes to a human |
-| Floating or upgrading `openhands-*` pins as a side effect | Exact pins are deliberate; bump explicitly and alone |
-| Committing to `main` of the fork | Feature branch → verify → merge; parent repo bumps the submodule separately |
+| Hunting for the agent loop in this repo | It's in the pinned `openhands-sdk` — clone `agent-sdk` at `v1.37.1` to read it |
+| Putting orchestration in `app_server` / `hook_loader.py` / `skill_loader.py` here | Dead in Ergatis's topology — the adapter never runs `app_server`. Use the start body + sandbox image in the parent repo |
+| Sending a new start-body field and trusting the `201` | Echo-assert via `GET /api/conversations/{id}`; fail the start if it did not land |
+| Building the gate on `critic` | Use the Stop hook; critic misses prose finishes and gets `git_patch=None` |
+| Letting the coding agent write or edit the acceptance suite | Frozen, outside its writable tree, generated by a separate stage |
+| Treating a failed verdict as terminal | Failures re-enter the bounded loop; only exhaustion goes to a human |
+| Building UI here for tenant interaction | Task Console only |
+| Floating `openhands-*` pins | Exact pins; bump explicitly, alone, with the contract test |
+| Committing to the fork's `main` | Feature branch → verify → merge |
