@@ -1,8 +1,6 @@
-*.ipynb linguist-vendored
+* text=auto eol=lf
 
-# force *nix line endings so files don't look modified in container run from Windows clone
-* text eol=lf
-# Git incorrectly thinks some media is text
-*.png -text
-*.gif -text
-*.mp4 -text
+# Icon binaries — never text-normalize (a mangled byte corrupts the file).
+*.png binary
+*.ico binary
+*.icns binary
